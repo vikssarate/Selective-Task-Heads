@@ -259,7 +259,7 @@ function addTopic(title, tags, startDateStr, defaultTime){
   };
   topics.push(topic);
   save(); renderAll();
-  // After adding, sync planner to this topic’s default time
+  // sync planner to this topic’s default time
   const sel = $("#planTopic"); if (sel){ sel.value = topic.id; }
   syncPlanTimeToSelected();
 }
@@ -434,7 +434,7 @@ $("#planThisMonth").addEventListener("click", ()=>{
   const {Y,M,days}=monthMeta(ymStr);
   const all = Array.from({length:days},(_,i)=> ymd(new Date(Y,M-1,i+1)) );
   const tid = $("#planTopic").value;
-  addFutureDates(tid, all); // uses topic.defaultTime
+  addFutureDates(tid, all);
 });
 $("#planNextMonth").addEventListener("click", ()=>{
   const [Y,M]=monthPick.value.split("-").map(Number);
@@ -565,7 +565,7 @@ function renderCalendar(){
     if (dueN>0) due += dueN;
     if (lateN>0) late = lateN;
 
-    // Tap: toggle using topic.defaultTime. Long-press/double-tap: edit time for that date.
+    // Tap / edit time handlers
     cell.addEventListener("click", ()=>{
       const dstr = ymd(dateObj);
       const tid = focusTopicId || $("#planTopic").value; if (!tid) return;
@@ -616,7 +616,7 @@ function renderCalendar(){
   $("#streak").textContent = streak;
 
   const mStart = new Date(Y,M-1,1), mEnd= addDays(new Date(Y,M-1,days),1);
-  let done=0; for (const t of focusedTopics()) done += (t.history||[]).filter(h=>{ const ts=new Date(h.ts); return ts>=mStart && ts<mEnd; }).length;
+  for (const t of focusedTopics()) done += (t.history||[]).filter(h=>{ const ts=new Date(h.ts); return ts>=mStart && ts<mEnd; }).length;
   $("#statDone").textContent = done;
 
   refreshPlanner();
