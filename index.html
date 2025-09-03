@@ -201,6 +201,11 @@ button{cursor:pointer}.primary{background:linear-gradient(180deg,#2f67ff,#2149c8
 </footer>
 
 <script>
+/*** Repo-scoped storage so each copy keeps its own data ***/
+const REPO_ID = (location.pathname.split('/').filter(Boolean)[0] || 'root'); // e.g. "math-app"
+const STORAGE_VER = 'v7';
+const SK = `sr.topics.${REPO_ID}.${STORAGE_VER}`;
+
 /*** Local-time date helpers (Safari-safe) ***/
 const pad2 = n => String(n).padStart(2,"0");
 const ymd = d => `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
@@ -213,15 +218,23 @@ function monthMeta(ymStr){ const [Y,M]=ymStr.split("-").map(Number); const first
 function ymdhm(d){ return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}` }
 
 /*** Data model ***/
-const SK = "sr.topics.v6";
+// topic: { id, title, tags[], ef, reps, interval, dueISO, lastISO, defaultTime, history[], future[] }
 let topics = load();
 function load(){
-  try{
-    const t = JSON.parse(localStorage.getItem(SK))
-           || JSON.parse(localStorage.getItem("sr.topics.v5"))
-           || [];
-    return Array.isArray(t)?t:[];
-  }catch(e){ return [] }
+  // Try this repo first; then gentle fallbacks (helps if you’re migrating)
+  const KEYS = [
+    SK,
+    `sr.topics.${REPO_ID}.v6`,
+    'sr.topics.v6',
+    'sr.topics.v5'
+  ];
+  for (const k of KEYS){
+    try{
+      const t = JSON.parse(localStorage.getItem(k));
+      if (Array.isArray(t)) return t;
+    }catch(_){}
+  }
+  return [];
 }
 function save(){ localStorage.setItem(SK, JSON.stringify(topics)) }
 
@@ -350,7 +363,7 @@ function removeFutureForDate(topicId, dateStr){
   save(); renderAll();
 }
 
-/*** Existing range planners ***/
+/*** Planner (bulk + modes) ***/
 const monthPick = { value: ym(today()) };
 function planInfoUpdate(){
   const id=$("#planTopic").value;
@@ -551,18 +564,15 @@ function renderCalendar(){
     if (dueN>0) due += dueN;
     if (lateN>0) late = lateN;
 
-    /* === NEW: tap to toggle, double-tap/long-press to edit time === */
-    // Single tap: quick toggle
+    // Tap to toggle; double-tap/long-press to edit time
     cell.addEventListener("click", ()=>{
       const dstr = ymd(dateObj);
       const hhmm = $("#planTime").value;
 
-      // Reschedule takes precedence
       if ($("#reschedMode").checked && focusTopicId){
         rescheduleDueToDate(focusTopicId, dstr, hhmm);
         return;
       }
-      // Plan mode: toggle without prompt
       if ($("#planMode").checked){
         const tid = focusTopicId || $("#planTopic").value; if (!tid) return;
         const t = topicById(tid); ensureFields(t);
@@ -572,7 +582,6 @@ function renderCalendar(){
       }
     });
 
-    // Double-click / long-press: edit specific time
     const editTime = ()=>{
       if (!$("#planMode").checked) return;
       const tid = focusTopicId || $("#planTopic").value; if (!tid) return;
@@ -581,18 +590,16 @@ function renderCalendar(){
       const idx = futureIndexByDate(t, dstr);
       const current = idx>=0 ? timeHHMMFromISO(t.future[idx].iso) : $("#planTime").value;
       let ans = prompt(`Time for "${t.title}" on ${dstr} (HH:MM). Leave blank to remove.`, current);
-      if (ans===null) return; // cancelled
+      if (ans===null) return;
       ans = ans.trim();
       if (ans===""){ removeFutureForDate(tid, dstr); return; }
       const norm = normalizeHHMM(ans);
       if (!norm){ alert("Enter time as HH:MM (00–23:00–59)."); return; }
       setFutureForDate(tid, dstr, norm);
     };
-    cell.addEventListener("dblclick", editTime);                // desktop
+    cell.addEventListener("dblclick", editTime);
     let pressTimer;
-    cell.addEventListener("touchstart", ()=>{                   // touch long-press
-      pressTimer = setTimeout(editTime, 500);
-    }, {passive:true});
+    cell.addEventListener("touchstart", ()=>{ pressTimer = setTimeout(editTime, 500); }, {passive:true});
     ["touchend","touchmove","touchcancel"].forEach(ev=>{
       cell.addEventListener(ev, ()=> clearTimeout(pressTimer), {passive:true});
     });
@@ -631,7 +638,7 @@ $("#nextM").addEventListener("click", ()=>{
 $("#exportJson").addEventListener("click", ()=>{
   const blob=new Blob([JSON.stringify({topics},null,2)],{type:"application/json"});
   const url=URL.createObjectURL(blob); const a=document.createElement("a");
-  a.href=url; a.download="spaced-repetition-backup.json"; a.click(); URL.revokeObjectURL(url);
+  a.href=url; a.download=`spaced-repetition-backup-${REPO_ID}.json`; a.click(); URL.revokeObjectURL(url);
 });
 document.getElementById("importJson").addEventListener("change",(e)=>{
   const f=e.target.files?.[0]; if(!f) return;
@@ -677,11 +684,11 @@ function download(filename, text){
 }
 $("#exportIcs").addEventListener("click", ()=>{
   const ics = makeIcsLines(90);
-  download("sr-planned.ics", ics);
+  download(`sr-planned-${REPO_ID}.ics`, ics);
 });
 $("#saveFeed").addEventListener("click", ()=>{
   const ics = makeIcsLines(180);
-  download("feed.ics", ics);
+  download(`feed-${REPO_ID}.ics`, ics);
 });
 
 /*** Render all ***/
