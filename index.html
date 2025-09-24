@@ -33,6 +33,8 @@ button{cursor:pointer}.primary{background:linear-gradient(180deg,#2f67ff,#2149c8
 .iconbtn.small{padding:4px 8px}
 .iconbtn.danger{border-color:var(--bad);color:var(--bad)}
 .linkbtn{background:none;border:none;color:var(--accent);text-decoration:underline;cursor:pointer;padding:0;font:inherit}
+.badge.sync{border-color:var(--accent)}
+.badge.err{border-color:var(--bad);color:var(--bad)}
 </style>
 </head>
 <body>
@@ -192,19 +194,51 @@ button{cursor:pointer}.primary{background:linear-gradient(180deg,#2f67ff,#2149c8
         <div class="muted">Daily streak (any reviews)</div>
       </div>
     </div>
+
+    <div class="sep"></div>
+
+    <!-- Sync Panel -->
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b>Cloud Sync (CouchDB)</b>
+        <span id="syncStatus" class="badge sync">idle</span>
+      </div>
+      <div class="small muted">Remote: <code>https://couch.techstudy.me/record</code></div>
+      <div class="row" style="margin-top:8px">
+        <label class="small"><input type="checkbox" id="liveSync" checked/> Live Sync</label>
+        <button id="btnPull">Pull from CouchDB</button>
+        <button id="btnPush">Push to CouchDB</button>
+        <button id="btnResetPull" class="iconbtn danger">Reset local & Pull</button>
+      </div>
+      <div class="small muted" id="lastSyncInfo">Last sync: never</div>
+    </div>
   </section>
 </div>
 
 <footer class="muted">
   <div>Tip: Export ICS and add it to Apple/Google Calendar to get notifications on iPad or Gmail.</div>
-  <div class="right small">Local-only; data saved to your browser.</div>
+  <div class="right small">Local + Cloud; data saved to your browser and synced to CouchDB.</div>
 </footer>
+
+<!-- PouchDB -->
+<script src="https://cdn.jsdelivr.net/npm/pouchdb@8.0.1/dist/pouchdb.min.js"></script>
 
 <script>
 /*** Repo-scoped storage so each copy keeps its own data ***/
 const REPO_ID = (location.pathname.split('/').filter(Boolean)[0] || 'root');
 const STORAGE_VER = 'v7';
 const SK = `sr.topics.${REPO_ID}.${STORAGE_VER}`;
+
+/*** CouchDB / PouchDB config ***/
+const COUCH_URL = 'https://couch.techstudy.me/record';   // remote DB (no auth)
+const DOC_ID    = `topics:${REPO_ID}:${STORAGE_VER}`;    // one doc storing all topics
+const DB_NAME   = `sr_${REPO_ID}_${STORAGE_VER}`;        // local PouchDB name
+
+const localDB  = new PouchDB(DB_NAME);
+const remoteDB = new PouchDB(COUCH_URL, { skip_setup: true });
+
+let syncHandler = null;
+let lastPulledRev = null;
 
 /*** Date helpers ***/
 const pad2 = n => String(n).padStart(2,"0");
@@ -214,22 +248,150 @@ function startOfDay(d){ const x=new Date(d); x.setHours(0,0,0,0); return x }
 function addDays(d,n){ const x=new Date(d); x.setDate(x.getDate()+n); return x }
 function isSameDay(a,b){ return startOfDay(a).getTime()===startOfDay(b).getTime() }
 function ym(d){ return `${d.getFullYear()}-${pad2(d.getMonth()+1)}` }
-function monthMeta(ymStr){ const [Y,M]=ymStr.split("-").map(Number); const first=new Date(Y,M-1,1); return {Y,M,startW:first.getDay(),days:new Date(Y,M,0).getDate()} }
 function ymdhm(d){ return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}` }
 
 /*** Data model ***/
-let topics = load();
-function load(){
+let topics = loadFromLocalStorage();
+
+/*** LocalStorage <-> UI ***/
+function loadFromLocalStorage(){
   const KEYS = [SK, `sr.topics.${REPO_ID}.v6`, 'sr.topics.v6', 'sr.topics.v5'];
   for (const k of KEYS){
     try{ const t = JSON.parse(localStorage.getItem(k)); if (Array.isArray(t)) return t; }catch(_){}
   }
   return [];
 }
-function save(){ localStorage.setItem(SK, JSON.stringify(topics)) }
+function saveToLocalStorage(){ localStorage.setItem(SK, JSON.stringify(topics)) }
 
-const $ = q => document.querySelector(q);
-const today = () => new Date();
+/*** Cloud save: write the single doc to local Pouch; live sync pipes to remote ***/
+async function saveToCloud(nonBlocking=true){
+  const now = new Date().toISOString();
+  try{
+    let doc;
+    try{ doc = await localDB.get(DOC_ID); }
+    catch(e){ if (e.status === 404) doc = { _id: DOC_ID }; else throw e; }
+    doc.topics = topics;
+    doc.updatedAt = now;
+    const res = await localDB.put(doc);
+    if (!nonBlocking) await res; // noop; kept for symmetry
+    updateSyncStatus('queued');
+  }catch(e){
+    console.warn('saveToCloud error', e);
+    updateSyncStatus('error', e.message);
+  }
+}
+
+/*** Cloud load (pull) -> replace localStorage + UI ***/
+async function pullFromRemote(){
+  updateSyncStatus('pulling');
+  try{
+    await PouchDB.replicate(remoteDB, localDB, { doc_ids: [DOC_ID] });
+    const doc = await localDB.get(DOC_ID);
+    if (doc && Array.isArray(doc.topics)){
+      topics = doc.topics.map(t=>({future:[], ...t}));
+      saveToLocalStorage();
+      lastPulledRev = doc._rev;
+      renderAll();
+    }
+    updateSyncStatus('ok', 'Pulled');
+  }catch(e){
+    console.warn('pull error', e);
+    updateSyncStatus('error', e.message || 'pull failed');
+  }
+}
+
+/*** Push local Pouch -> remote ***/
+async function pushToRemote(){
+  updateSyncStatus('pushing');
+  try{
+    await PouchDB.replicate(localDB, remoteDB, { doc_ids: [DOC_ID] });
+    updateSyncStatus('ok', 'Pushed');
+  }catch(e){
+    console.warn('push error', e);
+    updateSyncStatus('error', e.message || 'push failed');
+  }
+}
+
+/*** Live sync toggle ***/
+function startLiveSync(){
+  stopLiveSync();
+  syncHandler = PouchDB.sync(localDB, remoteDB, { live:true, retry:true, doc_ids:[DOC_ID] })
+    .on('change', info => {
+      updateSyncStatus('ok','change');
+      document.getElementById('lastSyncInfo').textContent = 'Last sync: ' + new Date().toLocaleString();
+    })
+    .on('paused', err => { if (err){ updateSyncStatus('error', err.message); } else { updateSyncStatus('idle'); }})
+    .on('active', () => updateSyncStatus('syncing'))
+    .on('denied', err => updateSyncStatus('error', 'denied'))
+    .on('complete', () => updateSyncStatus('idle'))
+    .on('error', err => updateSyncStatus('error', err.message || 'live sync error'));
+}
+function stopLiveSync(){ if (syncHandler && syncHandler.cancel){ syncHandler.cancel(); } syncHandler = null; }
+
+/*** Listen to local Pouch changes (remote or other tab) to refresh UI ***/
+localDB.changes({ live:true, include_docs:true, doc_ids:[DOC_ID] }).on('change', ev => {
+  if (!ev.doc) return;
+  // If the cloud version is newer/different, apply it
+  if (ev.doc._rev !== lastPulledRev){
+    if (Array.isArray(ev.doc.topics)){
+      topics = ev.doc.topics.map(t=>({future:[], ...t}));
+      saveToLocalStorage();
+      lastPulledRev = ev.doc._rev;
+      renderAll();
+      updateSyncStatus('ok','applied');
+    }
+  }
+}).on('error', e => updateSyncStatus('error', e.message));
+
+/*** Sync status helpers ***/
+function updateSyncStatus(state, note){
+  const el = document.getElementById('syncStatus');
+  if (!el) return;
+  const map = {
+    idle: 'idle',
+    syncing: 'syncing…',
+    queued: 'queued',
+    pushing: 'pushing…',
+    pulling: 'pulling…',
+    ok: 'ok',
+    error: 'error'
+  };
+  el.textContent = map[state] || state;
+  el.classList.toggle('err', state === 'error');
+  const last = document.getElementById('lastSyncInfo');
+  if (note){
+    last.textContent = `Last: ${note} @ ${new Date().toLocaleString()}`;
+  }
+}
+
+/*** Wire Sync panel buttons ***/
+document.addEventListener('DOMContentLoaded', ()=>{
+  const live = document.getElementById('liveSync');
+  live.addEventListener('change', ()=> live.checked ? startLiveSync() : stopLiveSync());
+  document.getElementById('btnPull').addEventListener('click', pullFromRemote);
+  document.getElementById('btnPush').addEventListener('click', async ()=>{
+    // ensure current topics saved to local Pouch before pushing
+    await saveToCloud();
+    await pushToRemote();
+  });
+  document.getElementById('btnResetPull').addEventListener('click', async ()=>{
+    if (!confirm('This will clear local browser copy and pull from CouchDB. Continue?')) return;
+    try{
+      // nuke local DB and localStorage copy
+      await localDB.destroy();
+      localStorage.removeItem(SK);
+      updateSyncStatus('idle','local cleared');
+      // recreate DB refs
+      window.location.reload();
+    }catch(e){
+      updateSyncStatus('error', e.message);
+    }
+  });
+  // Start live sync by default
+  startLiveSync();
+  // Initial pull-once to hydrate if empty
+  pullFromRemote();
+});
 
 /*** SM-2 ***/
 function nextIntervalSM2(t, q){
@@ -249,7 +411,7 @@ function nextIntervalSM2(t, q){
 function ensureFields(t){ t.future = t.future || []; if (!t.defaultTime) t.defaultTime = "19:00"; }
 
 function addTopic(title, tags, startDateStr, defaultTime){
-  const firstDate = startDateStr ? parseYMD(startDateStr) : today();
+  const firstDate = startDateStr ? parseYMD(startDateStr) : new Date();
   const [hh,mm] = (defaultTime||"19:00").split(":").map(Number);
   const due = new Date(firstDate); due.setHours(hh,mm,0,0);
   const topic = {
@@ -258,9 +420,8 @@ function addTopic(title, tags, startDateStr, defaultTime){
     history:[], future:[]
   };
   topics.push(topic);
-  save(); renderAll();
-  // sync planner to this topic’s default time
-  const sel = $("#planTopic"); if (sel){ sel.value = topic.id; }
+  persistAndRender();
+  const sel = document.getElementById("planTopic"); if (sel){ sel.value = topic.id; }
   syncPlanTimeToSelected();
 }
 const topicById = id => topics.find(t=>t.id===id);
@@ -270,7 +431,7 @@ function deleteTopic(id){
   if (!t) return;
   if (!confirm(`Delete topic "${t.title}"? This removes its history and any planned recalls.`)) return;
   topics = topics.filter(x=>x.id!==id);
-  save(); renderAll();
+  persistAndRender();
 }
 
 /*** Focus (topic) ***/
@@ -295,16 +456,16 @@ function updateFocusChip(){
 }
 
 /*** UI: Add & list ***/
-$("#addTopic").addEventListener("click", ()=>{
-  const title=$("#tTitle").value.trim(); if(!title) return;
-  const tags=$("#tTags").value.split(",").map(s=>s.trim()).filter(Boolean);
-  addTopic(title, tags, $("#tStartDate").value, $("#tTime").value);
-  $("#tTitle").value=""; $("#tTags").value="";
+document.getElementById("addTopic").addEventListener("click", ()=>{
+  const title=document.getElementById("tTitle").value.trim(); if(!title) return;
+  const tags=document.getElementById("tTags").value.split(",").map(s=>s.trim()).filter(Boolean);
+  addTopic(title, tags, document.getElementById("tStartDate").value, document.getElementById("tTime").value);
+  document.getElementById("tTitle").value=""; document.getElementById("tTags").value="";
 });
-(function(){ const d=document.getElementById("tStartDate"); if(d && !d.value) d.value = ymd(today()); })();
+(function(){ const d=document.getElementById("tStartDate"); if(d && !d.value) d.value = ymd(new Date()); })();
 
 function renderTopics(){
-  const box=$("#topics"); box.innerHTML="";
+  const box=document.getElementById("topics"); box.innerHTML="";
   for (const t of topics){
     ensureFields(t);
     const next = new Date(t.dueISO);
@@ -349,32 +510,32 @@ function setFutureForDate(topicId, dateStr, hhmm){
   const idx = futureIndexByDate(t, dateStr);
   if (idx>=0) t.future[idx].iso = iso; else t.future.push({iso});
   t.future.sort((a,b)=> new Date(a.iso)-new Date(b.iso));
-  save(); renderAll();
+  persistAndRender();
 }
 function removeFutureForDate(topicId, dateStr){
   const t=topicById(topicId); if(!t) return; ensureFields(t);
   t.future = (t.future||[]).filter(x => isoToYMD(x.iso)!==dateStr);
-  save(); renderAll();
+  persistAndRender();
 }
 
 /*** Planner (bulk + modes) ***/
-const monthPick = { value: ym(today()) };
+const monthPick = { value: ym(new Date()) };
 
 function syncPlanTimeToSelected(){
-  const tid = (focusTopicId ? focusTopicId : $("#planTopic").value);
+  const tid = (focusTopicId ? focusTopicId : document.getElementById("planTopic").value);
   const t = topicById(tid);
-  if (t){ $("#planTime").value = t.defaultTime || "19:00"; }
+  if (t){ document.getElementById("planTime").value = t.defaultTime || "19:00"; }
 }
 
 function planInfoUpdate(){
-  const id=$("#planTopic").value;
+  const id=document.getElementById("planTopic").value;
   const t = topicById(id);
   const count = t ? (t.future||[]).length : 0;
-  $("#planInfo").textContent = t ? `Planned recalls for "${t.title}": ${count}` : "";
+  document.getElementById("planInfo").textContent = t ? `Planned recalls for "${t.title}": ${count}` : "";
 }
 
 function refreshPlanner(){
-  const sel=$("#planTopic"); const cur=sel.value;
+  const sel=document.getElementById("planTopic"); const cur=sel.value;
   sel.innerHTML = topics.map(t=>`<option value="${t.id}">${t.title}</option>`).join("");
   if (topics.length && (!cur || !topics.some(t=>t.id===cur))) sel.value=topics[0]?.id || "";
   else sel.value=cur || "";
@@ -382,19 +543,20 @@ function refreshPlanner(){
   else { sel.disabled = false; }
   const {Y,M,days}=monthMeta(monthPick.value);
   const start = new Date(Y,M-1,1), end=new Date(Y,M-1,days);
-  if (!$("#rangeStart").value) $("#rangeStart").value = ymd(start);
-  if (!$("#rangeEnd").value)   $("#rangeEnd").value   = ymd(end);
-  if (!$("#everyStart").value) $("#everyStart").value = ymd(start);
-  if (!$("#everyEnd").value)   $("#everyEnd").value   = ymd(end);
+  if (!document.getElementById("rangeStart").value) document.getElementById("rangeStart").value = ymd(start);
+  if (!document.getElementById("rangeEnd").value)   document.getElementById("rangeEnd").value   = ymd(end);
+  if (!document.getElementById("everyStart").value) document.getElementById("everyStart").value = ymd(start);
+  if (!document.getElementById("everyEnd").value)   document.getElementById("everyEnd").value   = ymd(end);
   document.querySelectorAll('.wd').forEach(cb=>{
     if ([1,2,3,4,5].includes(+cb.dataset.wd) && cb.getAttribute('data-init')!=='1'){ cb.checked = true; cb.setAttribute('data-init','1'); }
   });
   syncPlanTimeToSelected();
   planInfoUpdate();
 }
-$("#planTopic").addEventListener("change", ()=>{ syncPlanTimeToSelected(); planInfoUpdate(); });
+document.getElementById("planTopic").addEventListener("change", ()=>{ syncPlanTimeToSelected(); planInfoUpdate(); });
 
 function selectedWeekdays(){ return Array.from(document.querySelectorAll(".wd:checked")).map(cb=>+cb.dataset.wd); }
+function monthMeta(ymStr){ const [Y,M]=ymStr.split("-").map(Number); const first=new Date(Y,M-1,1); return {Y,M,startW:first.getDay(),days:new Date(Y,M,0).getDate()} }
 
 function datesWeekdaysInMonth(ymStr, weekdays){
   const {Y,M,days}=monthMeta(ymStr); const out=[];
@@ -427,51 +589,51 @@ function addFutureDates(topicId, dateStrs, hhmm){
     if (!set.has(iso)){ t.future.push({iso}); set.add(iso); }
   }
   t.future.sort((a,b)=> new Date(a.iso)-new Date(b.iso));
-  save(); renderAll();
+  persistAndRender();
 }
-$("#planThisMonth").addEventListener("click", ()=>{
+document.getElementById("planThisMonth").addEventListener("click", ()=>{
   const ymStr = monthPick.value;
   const {Y,M,days}=monthMeta(ymStr);
   const all = Array.from({length:days},(_,i)=> ymd(new Date(Y,M-1,i+1)) );
-  const tid = $("#planTopic").value;
+  const tid = document.getElementById("planTopic").value;
   addFutureDates(tid, all);
 });
-$("#planNextMonth").addEventListener("click", ()=>{
+document.getElementById("planNextMonth").addEventListener("click", ()=>{
   const [Y,M]=monthPick.value.split("-").map(Number);
   const next = new Date(Y, M, 1);
   const ymStr = ym(next);
   const {Y:YY,M:MM,days}=monthMeta(ymStr);
   const all = Array.from({length:days},(_,i)=> ymd(new Date(YY,MM-1,i+1)) );
-  const tid = $("#planTopic").value;
+  const tid = document.getElementById("planTopic").value;
   addFutureDates(tid, all);
 });
-$("#planClear").addEventListener("click", ()=>{
-  const t=topicById($("#planTopic").value);
-  if (t && confirm(`Remove all planned recalls for "${t.title}"?`)){ t.future=[]; save(); renderAll(); }
+document.getElementById("planClear").addEventListener("click", ()=>{
+  const t=topicById(document.getElementById("planTopic").value);
+  if (t && confirm(`Remove all planned recalls for "${t.title}"?`)){ t.future=[]; persistAndRender(); }
 });
-$("#planWeekdaysThis").addEventListener("click", ()=>{
+document.getElementById("planWeekdaysThis").addEventListener("click", ()=>{
   const days = datesWeekdaysInMonth(monthPick.value, selectedWeekdays());
-  addFutureDates($("#planTopic").value, days);
+  addFutureDates(document.getElementById("planTopic").value, days);
 });
-$("#planWeekdaysNext").addEventListener("click", ()=>{
+document.getElementById("planWeekdaysNext").addEventListener("click", ()=>{
   const [Y,M]=monthPick.value.split("-").map(Number);
   const next=ym(new Date(Y,M,1));
   const days = datesWeekdaysInMonth(next, selectedWeekdays());
-  addFutureDates($("#planTopic").value, days);
+  addFutureDates(document.getElementById("planTopic").value, days);
 });
-$("#planWeekdaysBetween").addEventListener("click", ()=>{
-  const days = datesWeekdaysBetween($("#rangeStart").value, $("#rangeEnd").value, selectedWeekdays());
-  addFutureDates($("#planTopic").value, days);
+document.getElementById("planWeekdaysBetween").addEventListener("click", ()=>{
+  const days = datesWeekdaysBetween(document.getElementById("rangeStart").value, document.getElementById("rangeEnd").value, selectedWeekdays());
+  addFutureDates(document.getElementById("planTopic").value, days);
 });
-$("#planEveryN").addEventListener("click", ()=>{
-  const n = Math.max(1, +$("#stepN").value||1);
-  const days = datesEveryNDays($("#everyStart").value, $("#everyEnd").value, n);
-  addFutureDates($("#planTopic").value, days);
+document.getElementById("planEveryN").addEventListener("click", ()=>{
+  const n = Math.max(1, +document.getElementById("stepN").value||1);
+  const days = datesEveryNDays(document.getElementById("everyStart").value, document.getElementById("everyEnd").value, n);
+  addFutureDates(document.getElementById("planTopic").value, days);
 });
 
 /*** Review queue ***/
 function dueToday(){
-  const items=[]; const now=today(), end=addDays(startOfDay(now),1);
+  const items=[]; const now=new Date(), end=addDays(startOfDay(now),1);
   for (const t of focusedTopics()){
     ensureFields(t);
     if (new Date(t.dueISO) < end) items.push({kind:"auto", t, due:new Date(t.dueISO)});
@@ -509,7 +671,7 @@ function grade(item, q){
   t.ef=upd.ef; t.reps=upd.reps; t.interval=upd.interval;
   t.lastISO=(new Date()).toISOString();
 
-  const d = addDays(today(), t.interval);
+  const d = addDays(new Date(), t.interval);
   const [hh,mm] = (t.defaultTime || "19:00").split(":").map(Number);
   d.setHours(hh,mm,0,0);
   t.dueISO = d.toISOString();
@@ -519,22 +681,22 @@ function grade(item, q){
     item.t.future = item.t.future.filter(x=>x.iso!==iso);
   }
   t.history = t.history || []; t.history.push({ts: t.lastISO, q});
-  save(); renderAll();
+  persistAndRender();
 }
 
 /*** Reschedule helper ***/
 function rescheduleDueToDate(topicId, dateStr, hhmm){
   const t = topicById(topicId); if (!t) return;
   t.dueISO = isoFromDateTime(dateStr, hhmm || t.defaultTime);
-  save(); renderAll();
+  persistAndRender();
 }
 
 /*** Calendar ***/
 function renderCalendar(){
   const mval = monthPick.value;
   const {Y,M,startW,days} = monthMeta(mval);
-  $("#monthTitle").textContent = new Date(Y,M-1).toLocaleString(undefined,{month:"long",year:"numeric"});
-  const cal=$("#cal"); cal.innerHTML="";
+  document.getElementById("monthTitle").textContent = new Date(Y,M-1).toLocaleString(undefined,{month:"long",year:"numeric"});
+  const cal=document.getElementById("cal"); cal.innerHTML="";
   for(let i=0;i<startW;i++){ const g=document.createElement("div"); g.className="day"; cal.appendChild(g) }
 
   let due=0, late=0, done=0, streak=0, curStreak=0, lastHadReview=null;
@@ -568,12 +730,12 @@ function renderCalendar(){
     // Tap / edit time handlers
     cell.addEventListener("click", ()=>{
       const dstr = ymd(dateObj);
-      const tid = focusTopicId || $("#planTopic").value; if (!tid) return;
-      if ($("#reschedMode").checked && focusTopicId){
+      const tid = focusTopicId || document.getElementById("planTopic").value; if (!tid) return;
+      if (document.getElementById("reschedMode").checked && focusTopicId){
         rescheduleDueToDate(focusTopicId, dstr, topicById(focusTopicId)?.defaultTime);
         return;
       }
-      if ($("#planMode").checked){
+      if (document.getElementById("planMode").checked){
         const t = topicById(tid); ensureFields(t);
         const idx = futureIndexByDate(t, dstr);
         if (idx >= 0) removeFutureForDate(tid, dstr);
@@ -582,8 +744,8 @@ function renderCalendar(){
     });
 
     const editTime = ()=>{
-      if (!$("#planMode").checked) return;
-      const tid = focusTopicId || $("#planTopic").value; if (!tid) return;
+      if (!document.getElementById("planMode").checked) return;
+      const tid = focusTopicId || document.getElementById("planTopic").value; if (!tid) return;
       const t = topicById(tid); ensureFields(t);
       const dstr = ymd(dateObj);
       const idx = futureIndexByDate(t, dstr);
@@ -610,31 +772,32 @@ function renderCalendar(){
     if (curStreak>streak) streak=curStreak;
   }
 
-  $("#mDue").textContent = due;
-  $("#mLate").textContent = late;
-  $("#statDue").textContent = due;
-  $("#streak").textContent = streak;
+  document.getElementById("mDue").textContent = due;
+  document.getElementById("mLate").textContent = late;
+  document.getElementById("statDue").textContent = due;
+  document.getElementById("streak").textContent = streak;
 
   const mStart = new Date(Y,M-1,1), mEnd= addDays(new Date(Y,M-1,days),1);
+  let done=0;
   for (const t of focusedTopics()) done += (t.history||[]).filter(h=>{ const ts=new Date(h.ts); return ts>=mStart && ts<mEnd; }).length;
-  $("#statDone").textContent = done;
+  document.getElementById("statDone").textContent = done;
 
   refreshPlanner();
   updateFocusChip();
 }
 
 /*** Month nav ***/
-$("#prevM").addEventListener("click", ()=>{
+document.getElementById("prevM").addEventListener("click", ()=>{
   const [Y,M]=monthPick.value.split("-").map(Number);
   const prev=new Date(Y, M-2, 1); monthPick.value = ym(prev); renderCalendar();
 });
-$("#nextM").addEventListener("click", ()=>{
+document.getElementById("nextM").addEventListener("click", ()=>{
   const [Y,M]=monthPick.value.split("-").map(Number);
   const next=new Date(Y, M, 1); monthPick.value = ym(next); renderCalendar();
 });
 
 /*** Export / Import ***/
-$("#exportJson").addEventListener("click", ()=>{
+document.getElementById("exportJson").addEventListener("click", ()=>{
   const blob=new Blob([JSON.stringify({topics},null,2)],{type:"application/json"});
   const url=URL.createObjectURL(blob); const a=document.createElement("a");
   a.href=url; a.download=`spaced-repetition-backup-${REPO_ID}.json`; a.click(); URL.revokeObjectURL(url);
@@ -642,7 +805,8 @@ $("#exportJson").addEventListener("click", ()=>{
 document.getElementById("importJson").addEventListener("change",(e)=>{
   const f=e.target.files?.[0]; if(!f) return;
   const r=new FileReader(); r.onload=()=>{ try{
-    const data=JSON.parse(r.result); topics = (data.topics||[]).map(t=>({future:[],...t})); save(); renderAll(); alert("Imported");
+    const data=JSON.parse(r.result); topics = (data.topics||[]).map(t=>({future:[],...t}));
+    persistAndRender(true); alert("Imported");
   }catch(_){ alert("Invalid JSON") } }; r.readAsText(f);
 });
 
@@ -681,22 +845,31 @@ function download(filename, text){
   const url=URL.createObjectURL(blob);
   const a=document.createElement("a"); a.href=url; a.download=filename; a.click(); URL.revokeObjectURL(url);
 }
-$("#exportIcs").addEventListener("click", ()=>{
+document.getElementById("exportIcs").addEventListener("click", ()=>{
   const ics = makeIcsLines(90);
   download(`sr-planned-${REPO_ID}.ics`, ics);
 });
-$("#saveFeed").addEventListener("click", ()=>{
+document.getElementById("saveFeed").addEventListener("click", ()=>{
   const ics = makeIcsLines(180);
   download(`feed-${REPO_ID}.ics`, ics);
 });
 
+/*** Persist + render wrapper (saves locally AND to cloud, then optional push) ***/
+function persistAndRender(pushAfter=false){
+  saveToLocalStorage();
+  renderAll();
+  // fire-and-forget to Pouch (local); live sync will stream to remote
+  saveToCloud(true);
+  if (pushAfter){ pushToRemote(); }
+}
+
 /*** Render all ***/
 function renderAll(){ renderQueue(); renderTopics(); renderCalendar(); }
 function renderQueue(){
-  const q = $("#queue"); q.innerHTML="";
+  const q = document.getElementById("queue"); q.innerHTML="";
   const items = dueToday();
-  $("#dueCount").textContent = items.length;
-  $("#todayStr").textContent = today().toLocaleDateString(undefined,{weekday:"short",year:"numeric",month:"short",day:"numeric"});
+  document.getElementById("dueCount").textContent = items.length;
+  document.getElementById("todayStr").textContent = new Date().toLocaleDateString(undefined,{weekday:"short",year:"numeric",month:"short",day:"numeric"});
   if(!items.length){ q.innerHTML=`<div class="muted">Nothing due today 🎉</div>`; return; }
   items.forEach(it=> q.appendChild(queueItem(it)));
 }
