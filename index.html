@@ -695,7 +695,8 @@ function rescheduleDueToDate(topicId, dateStr, hhmm){
 function renderCalendar(){
   const mval = monthPick.value;
   const {Y,M,startW,days} = monthMeta(mval);
-  document.getElementById("monthTitle").textContent = new Date(Y,M-1).toLocaleString(undefined,{month:"long",year:"numeric"});
+  document.getElementById("monthTitle").textContent =
+    new Date(Y,M-1).toLocaleString(undefined,{month:"long",year:"numeric"});
   const cal=document.getElementById("cal"); cal.innerHTML="";
   for(let i=0;i<startW;i++){ const g=document.createElement("div"); g.className="day"; cal.appendChild(g) }
 
@@ -727,7 +728,6 @@ function renderCalendar(){
     if (dueN>0) due += dueN;
     if (lateN>0) late = lateN;
 
-    // Tap / edit time handlers
     cell.addEventListener("click", ()=>{
       const dstr = ymd(dateObj);
       const tid = focusTopicId || document.getElementById("planTopic").value; if (!tid) return;
@@ -778,14 +778,14 @@ function renderCalendar(){
   document.getElementById("streak").textContent = streak;
 
   const mStart = new Date(Y,M-1,1), mEnd= addDays(new Date(Y,M-1,days),1);
-  let done=0;
-  for (const t of focusedTopics()) done += (t.history||[]).filter(h=>{ const ts=new Date(h.ts); return ts>=mStart && ts<mEnd; }).length;
+  done = 0;  // <-- reset instead of re-declare
+  for (const t of focusedTopics())
+    done += (t.history||[]).filter(h=>{ const ts=new Date(h.ts); return ts>=mStart && ts<mEnd; }).length;
   document.getElementById("statDone").textContent = done;
 
   refreshPlanner();
   updateFocusChip();
 }
-
 /*** Month nav ***/
 document.getElementById("prevM").addEventListener("click", ()=>{
   const [Y,M]=monthPick.value.split("-").map(Number);
